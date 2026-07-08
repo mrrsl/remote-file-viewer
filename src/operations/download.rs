@@ -36,17 +36,25 @@ pub fn get_editor() -> String {
 /// Checks the file size against `max_size` before downloading.
 /// Returns the NamedTempFile on success. The temp file is automatically
 /// deleted when dropped (on error or when the caller is done with it).
+/// If `use_sudo` is true and SFTP returns PermissionDenied, retries with sudo.
 pub fn download_to_temp(
     ssh: &SshClient,
     remote_path: &Path,
     max_size: u64,
+    use_sudo: bool,
 ) -> Result<NamedTempFile, String> {
     // Check file size before downloading
-    let stat = ssh.stat(remote_path).map_err(|e| {
-        format!("Cannot read file info: {}", e)
-    })?;
+    let file_size = match ssh.stat(remote_path) {
+        Ok(stat) => stat.size.unwrap_or(0),
+        Err(crate::ssh::SshError::PermissionDenied(_)) if use_sudo => {
+            let (_, size) = ssh.sudo_stat(remote_path).map_err(|e| {
+                format!("Cannot read file info: {}", e)
+            })?;
+            size
+        }
+        Err(e) => return Err(format!("Cannot read file info: {}", e)),
+    };
 
-    let file_size = stat.size.unwrap_or(0);
     if file_size > max_size {
         let size_mb = file_size as f64 / (1024.0 * 1024.0);
         return Err(format!(
@@ -61,11 +69,21 @@ pub fn download_to_temp(
         format!("Failed to create temporary file: {}", e)
     })?;
 
-    // Download to temp file
-    ssh.download_file(remote_path, &mut temp_file).map_err(|e| {
-        // temp_file is dropped here, auto-deleting the partial file
-        format!("Download failed: {}", e)
-    })?;
+    // Download to temp file — try SFTP first, fallback to sudo cat
+    let download_result = ssh.download_file(remote_path, &mut temp_file);
+    match download_result {
+        Ok(_) => {}
+        Err(crate::ssh::SshError::PermissionDenied(_)) if use_sudo => {
+            // Reset temp file and retry with sudo
+            temp_file = NamedTempFile::new().map_err(|e| {
+                format!("Failed to create temporary file: {}", e)
+            })?;
+            ssh.sudo_download_file(remote_path, &mut temp_file).map_err(|e| {
+                format!("Download failed (sudo): {}", e)
+            })?;
+        }
+        Err(e) => return Err(format!("Download failed: {}", e)),
+    }
 
     // Flush to ensure all data is written
     temp_file.flush().map_err(|e| {
@@ -101,8 +119,8 @@ pub fn open_in_editor(file_path: &Path) -> Result<(), String> {
 /// This is a convenience function that combines `download_to_temp` and `open_in_editor`.
 /// The caller is responsible for suspending/resuming the TUI before/after calling this.
 /// The temporary file is automatically deleted when this function returns.
-pub fn view_file(ssh: &SshClient, remote_path: &Path) -> Result<(), String> {
-    let temp_file = download_to_temp(ssh, remote_path, MAX_VIEW_SIZE)?;
+pub fn view_file(ssh: &SshClient, remote_path: &Path, use_sudo: bool) -> Result<(), String> {
+    let temp_file = download_to_temp(ssh, remote_path, MAX_VIEW_SIZE, use_sudo)?;
 
     let result = open_in_editor(temp_file.path());
 
@@ -146,10 +164,12 @@ pub fn validate_copy_destination(local_path: &Path) -> Result<(), String> {
 ///
 /// On error, any partially written local file is deleted before returning
 /// the error message. On success, returns the total number of bytes written.
+/// If `use_sudo` is true and SFTP returns PermissionDenied, retries with sudo.
 pub fn copy_remote_file(
     ssh: &SshClient,
     remote_path: &Path,
     local_path: &Path,
+    use_sudo: bool,
 ) -> Result<u64, String> {
     // Create/open the local file for writing
     let mut file = fs::File::create(local_path).map_err(|e| {
@@ -161,6 +181,19 @@ pub fn copy_remote_file(
 
     match result {
         Ok(bytes_written) => Ok(bytes_written),
+        Err(crate::ssh::SshError::PermissionDenied(_)) if use_sudo => {
+            // Re-create file and retry with sudo
+            let mut file = fs::File::create(local_path).map_err(|e| {
+                format!("Failed to create local file '{}': {}", local_path.display(), e)
+            })?;
+            match ssh.sudo_download_file(remote_path, &mut file) {
+                Ok(bytes_written) => Ok(bytes_written),
+                Err(ssh_err) => {
+                    let _ = fs::remove_file(local_path);
+                    Err(format!("File transfer failed (sudo): {}", ssh_err))
+                }
+            }
+        }
         Err(ssh_err) => {
             // Delete the partial file on error
             let _ = fs::remove_file(local_path);

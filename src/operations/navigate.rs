@@ -24,16 +24,24 @@ pub fn validate_absolute_path(input: &str) -> bool {
 /// - If the path is a file or symlink, returns `NavigateTarget::File` with the parent
 ///   directory and filename extracted from the path.
 /// - If stat fails, propagates the `SshError`.
+/// - If `use_sudo` is true and SFTP stat returns PermissionDenied, retries with sudo.
 pub fn resolve_navigate_target(
     ssh: &SshClient,
     path: &Path,
+    use_sudo: bool,
 ) -> Result<NavigateTarget, SshError> {
-    let stat = ssh.stat(path)?;
+    let is_dir = match ssh.stat(path) {
+        Ok(stat) => stat.is_dir(),
+        Err(SshError::PermissionDenied(_)) if use_sudo => {
+            let (is_dir, _) = ssh.sudo_stat(path)?;
+            is_dir
+        }
+        Err(e) => return Err(e),
+    };
 
-    if stat.is_dir() {
+    if is_dir {
         Ok(NavigateTarget::Directory(path.to_path_buf()))
     } else {
-        // It's a file or symlink — compute parent and filename
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let filename = path
             .file_name()

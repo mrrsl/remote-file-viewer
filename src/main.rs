@@ -65,12 +65,12 @@ fn main() {
 
     // List home directory as initial content
     let home_path = PathBuf::from(format!("/home/{}", config.username));
-    let (initial_path, initial_entries) = match operations::listing::list_directory(&ssh, &home_path, false) {
+    let (initial_path, initial_entries) = match operations::listing::list_directory(&ssh, &home_path, false, config.use_sudo) {
         Ok(entries) => (home_path, entries),
         Err(_) => {
             // Fall back to "/" if home directory fails
             let root = PathBuf::from("/");
-            match operations::listing::list_directory(&ssh, &root, false) {
+            match operations::listing::list_directory(&ssh, &root, false, config.use_sudo) {
                 Ok(entries) => (root, entries),
                 Err(e) => {
                     eprintln!("Error: Failed to list initial directory: {}", e);
@@ -135,6 +135,7 @@ fn run_event_loop(
     ssh: &SshClient,
     config: &AppConfig,
 ) -> Result<(), String> {
+    let use_sudo = config.use_sudo;
     loop {
         // Clear expired status messages
         app.clear_expired_status();
@@ -186,12 +187,12 @@ fn run_event_loop(
                 }
             }
             Action::Enter => {
-                handle_enter(app, ssh);
+                handle_enter(app, ssh, use_sudo);
             }
             Action::GoParent => {
                 let parent = operations::listing::parent_path(&app.current_path);
                 if parent != app.current_path {
-                    match operations::listing::list_directory(ssh, &parent, app.show_hidden) {
+                    match operations::listing::list_directory(ssh, &parent, app.show_hidden, use_sudo) {
                         Ok(entries) => {
                             app.current_path = parent;
                             app.entries = entries;
@@ -203,7 +204,7 @@ fn run_event_loop(
             }
             Action::ToggleHidden => {
                 app.show_hidden = !app.show_hidden;
-                match operations::listing::list_directory(ssh, &app.current_path, app.show_hidden) {
+                match operations::listing::list_directory(ssh, &app.current_path, app.show_hidden, use_sudo) {
                     Ok(entries) => {
                         app.entries = entries;
                         app.selected_index = 0;
@@ -219,7 +220,7 @@ fn run_event_loop(
                         let _ = disable_raw_mode();
                         let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
                         // View file
-                        if let Err(msg) = operations::download::view_file(ssh, &remote_path) {
+                        if let Err(msg) = operations::download::view_file(ssh, &remote_path, use_sudo) {
                             app.set_status(error_status(msg));
                         }
                         // Resume TUI
@@ -256,7 +257,7 @@ fn run_event_loop(
                 }
             }
             Action::ConfirmInput => {
-                handle_confirm_input(app, ssh);
+                handle_confirm_input(app, ssh, use_sudo);
             }
             Action::CancelInput => {
                 match app.mode {
@@ -274,7 +275,7 @@ fn run_event_loop(
                     app.mode = AppMode::Browsing;
                     app.path_prompt_state = None;
                     if let Some(rp) = remote_path {
-                        match operations::download::copy_remote_file(ssh, &rp, &local_path) {
+                        match operations::download::copy_remote_file(ssh, &rp, &local_path, use_sudo) {
                             Ok(bytes) => app.set_status(success_status(format!(
                                 "Copied {} to {}",
                                 types::format_size(bytes),
@@ -299,13 +300,13 @@ fn run_event_loop(
     }
 }
 
-fn handle_enter(app: &mut App, ssh: &SshClient) {
+fn handle_enter(app: &mut App, ssh: &SshClient, use_sudo: bool) {
     match app.mode {
         AppMode::Browsing => {
             if let Some(entry) = app.selected_entry() {
                 if entry.entry_type == EntryType::Directory {
                     let path = entry.path.clone();
-                    match operations::listing::list_directory(ssh, &path, app.show_hidden) {
+                    match operations::listing::list_directory(ssh, &path, app.show_hidden, use_sudo) {
                         Ok(entries) => {
                             app.current_path = path;
                             app.entries = entries;
@@ -318,7 +319,7 @@ fn handle_enter(app: &mut App, ssh: &SshClient) {
         }
         AppMode::SearchResults => {
             if let Some(nav) = app.resolve_search_selection() {
-                match operations::listing::list_directory(ssh, &nav.target_path, app.show_hidden) {
+                match operations::listing::list_directory(ssh, &nav.target_path, app.show_hidden, use_sudo) {
                     Ok(entries) => {
                         app.current_path = nav.target_path;
                         app.entries = entries;
@@ -336,7 +337,7 @@ fn handle_enter(app: &mut App, ssh: &SshClient) {
     }
 }
 
-fn handle_confirm_input(app: &mut App, ssh: &SshClient) {
+fn handle_confirm_input(app: &mut App, ssh: &SshClient, use_sudo: bool) {
     match app.mode.clone() {
         AppMode::SearchPrompt { search_type } => {
             let query = app.search_query().unwrap_or("").to_string();
@@ -350,6 +351,7 @@ fn handle_confirm_input(app: &mut App, ssh: &SshClient) {
                             &app.current_path,
                             &query,
                             app.show_hidden,
+                            use_sudo,
                         ) {
                             Ok(results) => app.set_search_results(results),
                             Err(e) => {
@@ -364,6 +366,7 @@ fn handle_confirm_input(app: &mut App, ssh: &SshClient) {
                             &app.current_path,
                             &query,
                             app.show_hidden,
+                            use_sudo,
                             |_| true,
                         ) {
                             Ok(results) => app.set_search_results(results),
@@ -394,7 +397,7 @@ fn handle_confirm_input(app: &mut App, ssh: &SshClient) {
                     let remote_path = app.selected_entry().map(|e| e.path.clone());
                     app.cancel_path_prompt();
                     if let Some(rp) = remote_path {
-                        match operations::download::copy_remote_file(ssh, &rp, &local_path) {
+                        match operations::download::copy_remote_file(ssh, &rp, &local_path, use_sudo) {
                             Ok(bytes) => app.set_status(success_status(format!(
                                 "Copied {} to {}",
                                 types::format_size(bytes),
@@ -417,9 +420,9 @@ fn handle_confirm_input(app: &mut App, ssh: &SshClient) {
                 app.cancel_navigate();
             } else {
                 let path = PathBuf::from(&input);
-                match operations::navigate::resolve_navigate_target(ssh, &path) {
+                match operations::navigate::resolve_navigate_target(ssh, &path, use_sudo) {
                     Ok(operations::navigate::NavigateTarget::Directory(dir)) => {
-                        match operations::listing::list_directory(ssh, &dir, app.show_hidden) {
+                        match operations::listing::list_directory(ssh, &dir, app.show_hidden, use_sudo) {
                             Ok(entries) => {
                                 app.current_path = dir;
                                 app.entries = entries;
@@ -430,7 +433,7 @@ fn handle_confirm_input(app: &mut App, ssh: &SshClient) {
                         app.cancel_navigate();
                     }
                     Ok(operations::navigate::NavigateTarget::File { parent, filename }) => {
-                        match operations::listing::list_directory(ssh, &parent, app.show_hidden) {
+                        match operations::listing::list_directory(ssh, &parent, app.show_hidden, use_sudo) {
                             Ok(entries) => {
                                 app.current_path = parent;
                                 app.entries = entries;

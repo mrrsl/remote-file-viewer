@@ -25,12 +25,20 @@ pub fn resolve_relative(relative: &str, working_dir: &Path) -> PathBuf {
 ///
 /// Calls `ssh.list_dir(path)`, removes entries whose name starts with '.'
 /// when `show_hidden` is false, and sorts the result using `sort_entries`.
+/// If `use_sudo` is true and SFTP returns PermissionDenied, retries with sudo.
 pub fn list_directory(
     ssh: &SshClient,
     path: &Path,
     show_hidden: bool,
+    use_sudo: bool,
 ) -> Result<Vec<DirectoryEntry>, SshError> {
-    let mut entries = ssh.list_dir(path)?;
+    let mut entries = match ssh.list_dir(path) {
+        Ok(e) => e,
+        Err(SshError::PermissionDenied(_)) if use_sudo => {
+            ssh.sudo_list_dir(path)?
+        }
+        Err(e) => return Err(e),
+    };
 
     if !show_hidden {
         entries.retain(|entry| !entry.name.starts_with('.'));

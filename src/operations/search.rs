@@ -46,13 +46,21 @@ pub fn format_search_result(entry: &DirectoryEntry, base: &Path) -> String {
 /// Lists entries in `dir` via SSH, then filters to those whose name contains `query`
 /// (case-insensitive). Hidden entries (names starting with '.') are excluded unless
 /// `show_hidden` is true.
+/// If `use_sudo` is true and SFTP returns PermissionDenied, retries with sudo.
 pub fn local_find(
     ssh: &SshClient,
     dir: &Path,
     query: &str,
     show_hidden: bool,
+    use_sudo: bool,
 ) -> Result<Vec<DirectoryEntry>, SshError> {
-    let entries = ssh.list_dir(dir)?;
+    let entries = match ssh.list_dir(dir) {
+        Ok(e) => e,
+        Err(SshError::PermissionDenied(_)) if use_sudo => {
+            ssh.sudo_list_dir(dir)?
+        }
+        Err(e) => return Err(e),
+    };
 
     let results = entries
         .into_iter()
@@ -75,14 +83,20 @@ pub fn local_find(
 /// Filters results for hidden entries if `show_hidden` is false.
 /// Calls `on_progress` periodically with the count of entries processed so far.
 /// If `on_progress` returns `false`, the search is aborted and current results are returned.
+/// If `use_sudo` is true, the find command is run with sudo.
 pub fn global_find(
     ssh: &SshClient,
     base: &Path,
     query: &str,
     show_hidden: bool,
+    use_sudo: bool,
     mut on_progress: impl FnMut(usize) -> bool,
 ) -> Result<Vec<DirectoryEntry>, SshError> {
-    let all_entries = ssh.find_recursive(base, query)?;
+    let all_entries = if use_sudo {
+        ssh.sudo_find_recursive(base, query)?
+    } else {
+        ssh.find_recursive(base, query)?
+    };
 
     let mut results = Vec::new();
     let mut dir_count: usize = 0;

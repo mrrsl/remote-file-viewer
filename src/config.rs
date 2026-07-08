@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub ssh_identity_file: PathBuf,
     pub username: String,
     pub ip_address: String,
+    pub use_sudo: bool,
 }
 
 /// Errors that can occur during config file parsing.
@@ -59,6 +60,7 @@ impl AppConfig {
         let mut ssh_identity_file: Option<PathBuf> = None;
         let mut username: Option<String> = None;
         let mut ip_address: Option<String> = None;
+        let mut use_sudo: bool = false;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -89,6 +91,9 @@ impl AppConfig {
                 "ip_address" => {
                     ip_address = Some(value.to_string());
                 }
+                "use_sudo" => {
+                    use_sudo = value == "true";
+                }
                 _ => {
                     // Ignore unknown keys
                 }
@@ -104,6 +109,7 @@ impl AppConfig {
             ssh_identity_file,
             username,
             ip_address,
+            use_sudo,
         })
     }
 }
