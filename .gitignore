@@ -1,3 +1,4 @@
-target
+target/
+.vscode/
 Cargo.lock
 kafka-term-config

@@ -39,6 +39,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &AppMode) -> Action {
         AppMode::NavigatePrompt => handle_text_input(key),
         AppMode::Searching { .. } => handle_searching(key),
         AppMode::Copying { .. } => Action::None,
+        AppMode::DirectoryCopyConfirm { .. } => handle_dir_copy_confirm(key),
     }
 }
 
@@ -55,8 +56,8 @@ fn handle_browsing(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
         KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
-        KeyCode::Enter => Action::Enter,
-        KeyCode::Backspace | KeyCode::Char('-') => Action::GoParent,
+        KeyCode::Enter | KeyCode::Right => Action::Enter,
+        KeyCode::Backspace | KeyCode::Char('-') | KeyCode::Left => Action::GoParent,
         KeyCode::Char('o') => Action::OpenFile,
         KeyCode::Char('c') => Action::CopyFile,
         KeyCode::Char('q') => Action::Quit,
@@ -98,6 +99,16 @@ fn handle_searching(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc => Action::AbortSearch,
         _ => Action::None,
+    }
+}
+
+fn handle_dir_copy_confirm(key: KeyEvent) -> Action {
+    if key.code == KeyCode::Char('y') && key.modifiers == KeyModifiers::NONE {
+        Action::ConfirmOverwrite
+    } else if matches!(key.code, KeyCode::Char('n') | KeyCode::Esc) {
+        Action::DenyOverwrite
+    } else {
+        Action::None
     }
 }
 
@@ -159,6 +170,16 @@ mod tests {
     #[test]
     fn browsing_dash_parent() {
         assert_eq!(handle_key_event(key(KeyCode::Char('-')), &AppMode::Browsing), Action::GoParent);
+    }
+
+    #[test]
+    fn browsing_left_arrow_parent() {
+        assert_eq!(handle_key_event(key(KeyCode::Left), &AppMode::Browsing), Action::GoParent);
+    }
+
+    #[test]
+    fn browsing_right_arrow_enter() {
+        assert_eq!(handle_key_event(key(KeyCode::Right), &AppMode::Browsing), Action::Enter);
     }
 
     #[test]
@@ -351,5 +372,61 @@ mod tests {
         assert_eq!(handle_key_event(key(KeyCode::Char('q')), &mode), Action::None);
         assert_eq!(handle_key_event(key(KeyCode::Esc), &mode), Action::None);
         assert_eq!(handle_key_event(key(KeyCode::Enter), &mode), Action::None);
+    }
+
+    // --- DirectoryCopyConfirm mode tests ---
+
+    #[test]
+    fn dir_copy_confirm_y_confirm() {
+        let mode = AppMode::DirectoryCopyConfirm { path: std::path::PathBuf::from("/remote/dir"), size: 1024 };
+        assert_eq!(handle_key_event(key(KeyCode::Char('y')), &mode), Action::ConfirmOverwrite);
+    }
+
+    #[test]
+    fn dir_copy_confirm_n_deny() {
+        let mode = AppMode::DirectoryCopyConfirm { path: std::path::PathBuf::from("/remote/dir"), size: 1024 };
+        assert_eq!(handle_key_event(key(KeyCode::Char('n')), &mode), Action::DenyOverwrite);
+    }
+
+    #[test]
+    fn dir_copy_confirm_escape_deny() {
+        let mode = AppMode::DirectoryCopyConfirm { path: std::path::PathBuf::from("/remote/dir"), size: 1024 };
+        assert_eq!(handle_key_event(key(KeyCode::Esc), &mode), Action::DenyOverwrite);
+    }
+
+    #[test]
+    fn dir_copy_confirm_modified_y_none() {
+        let mode = AppMode::DirectoryCopyConfirm { path: std::path::PathBuf::from("/remote/dir"), size: 1024 };
+        assert_eq!(handle_key_event(key_ctrl(KeyCode::Char('y')), &mode), Action::None);
+    }
+
+    #[test]
+    fn dir_copy_confirm_other_none() {
+        let mode = AppMode::DirectoryCopyConfirm { path: std::path::PathBuf::from("/remote/dir"), size: 1024 };
+        assert_eq!(handle_key_event(key(KeyCode::Char('x')), &mode), Action::None);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    // Feature: arrow-nav-and-dir-download, Property 3: Non-confirm keys → None
+    // Validates: Requirements 4.4
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn non_confirm_keys_produce_none(c in any::<char>().prop_filter("not y or n", |c| *c != 'y' && *c != 'n')) {
+            let key = KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            };
+            prop_assert_eq!(handle_dir_copy_confirm(key), Action::None);
+        }
     }
 }

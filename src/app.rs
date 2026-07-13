@@ -23,6 +23,7 @@ pub enum AppMode {
     OverwriteConfirm { path: PathBuf },
     Copying { bytes_transferred: u64 },
     NavigatePrompt,
+    DirectoryCopyConfirm { path: PathBuf, size: u64 },
 }
 
 /// State for an active or completed search operation.

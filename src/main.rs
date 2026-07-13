@@ -16,6 +16,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use std::path::Path;
+
 use app::{App, AppMode, SearchType};
 use config::AppConfig;
 use event::{handle_key_event, Action};
@@ -35,6 +37,49 @@ fn success_status(msg: String) -> StatusMessage {
         text: msg,
         level: StatusLevel::Success,
         created_at: Instant::now(),
+    }
+}
+
+/// Format a status message for directory copy results.
+///
+/// Handles four cases:
+/// - All files failed (Req 7.3): error status
+/// - Empty directory: success with empty note
+/// - Partial success (Req 7.2): success with failure/skip counts
+/// - All success (Req 7.4): success with bytes and file count
+fn format_dir_copy_status(result: &operations::download::DirCopyResult, local_path: &Path) -> StatusMessage {
+    let total_failures = result.failures.len();
+
+    if result.files_copied == 0 && total_failures > 0 {
+        // All files failed (Req 7.3)
+        error_status(format!(
+            "No files copied. {} file(s) failed",
+            total_failures
+        ))
+    } else if result.files_copied == 0 && total_failures == 0 {
+        // Empty directory — nothing to download
+        success_status(format!(
+            "Directory downloaded to {} (empty directory)",
+            local_path.display()
+        ))
+    } else if total_failures > 0 {
+        // Partial success (Req 7.2)
+        success_status(format!(
+            "Downloaded {} ({} files) to {} ({} failed, {} symlinks skipped)",
+            types::format_size(result.bytes_transferred),
+            result.files_copied,
+            local_path.display(),
+            total_failures,
+            result.symlinks_skipped,
+        ))
+    } else {
+        // All success (Req 7.4)
+        success_status(format!(
+            "Downloaded {} ({} files) to {}",
+            types::format_size(result.bytes_transferred),
+            result.files_copied,
+            local_path.display(),
+        ))
     }
 }
 
@@ -231,7 +276,17 @@ fn run_event_loop(
             }
             Action::CopyFile => {
                 if let Some(entry) = app.selected_entry() {
-                    if entry.entry_type != EntryType::Directory {
+                    if entry.entry_type == EntryType::Directory {
+                        let remote_path = entry.path.clone();
+                        match ssh.dir_size(&remote_path) {
+                            Ok(size) => {
+                                app.mode = AppMode::DirectoryCopyConfirm { path: remote_path, size };
+                            }
+                            Err(e) => {
+                                app.set_status(error_status(format!("Failed to get directory size: {}", e)));
+                            }
+                        }
+                    } else {
                         app.start_copy_prompt(entry.name.clone());
                     }
                 }
@@ -268,21 +323,49 @@ fn run_event_loop(
             }
             Action::AbortSearch => app.cancel_search(),
             Action::ConfirmOverwrite => {
-                if let AppMode::OverwriteConfirm { ref path } = app.mode {
-                    let local_path = path.clone();
-                    let remote_path = app.selected_entry().map(|e| e.path.clone());
-                    app.mode = AppMode::Browsing;
-                    app.path_prompt_state = None;
-                    if let Some(rp) = remote_path {
-                        match operations::download::copy_remote_file(ssh, &rp, &local_path) {
-                            Ok(bytes) => app.set_status(success_status(format!(
-                                "Copied {} to {}",
-                                types::format_size(bytes),
-                                local_path.display()
-                            ))),
-                            Err(msg) => app.set_status(error_status(msg)),
+                match &app.mode {
+                    AppMode::OverwriteConfirm { path } => {
+                        let local_path = path.clone();
+                        let remote_path = app.selected_entry().map(|e| e.path.clone());
+                        let entry_type = app.selected_entry().map(|e| e.entry_type.clone());
+                        app.mode = AppMode::Browsing;
+                        app.path_prompt_state = None;
+                        if let Some(rp) = remote_path {
+                            if entry_type == Some(EntryType::Directory) {
+                                // Directory overwrite: delete existing dir, then download
+                                if let Err(e) = std::fs::remove_dir_all(&local_path) {
+                                    app.set_status(error_status(format!(
+                                        "Failed to remove existing directory '{}': {}",
+                                        local_path.display(), e
+                                    )));
+                                } else {
+                                    match operations::download::copy_remote_directory(ssh, &rp, &local_path) {
+                                        Ok(result) => {
+                                            app.set_status(format_dir_copy_status(&result, &local_path));
+                                        }
+                                        Err(msg) => app.set_status(error_status(msg)),
+                                    }
+                                }
+                            } else {
+                                // File/symlink overwrite: preserve existing logic
+                                match operations::download::copy_remote_file(ssh, &rp, &local_path) {
+                                    Ok(bytes) => app.set_status(success_status(format!(
+                                        "Copied {} to {}",
+                                        types::format_size(bytes),
+                                        local_path.display()
+                                    ))),
+                                    Err(msg) => app.set_status(error_status(msg)),
+                                }
+                            }
                         }
                     }
+                    AppMode::DirectoryCopyConfirm { path, .. } => {
+                        let dir_name = path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        app.start_copy_prompt(dir_name);
+                    }
+                    _ => {}
                 }
             }
             Action::DenyOverwrite => {
@@ -379,28 +462,57 @@ fn handle_confirm_input(app: &mut App, ssh: &SshClient) {
         AppMode::PathPrompt => {
             let input = app.get_path_input().unwrap_or("").to_string();
             if input.is_empty() {
+                // Req 5.5: empty path → error status
+                app.set_status(error_status("Destination path is required".to_string()));
                 app.cancel_path_prompt();
             } else {
                 let working_dir = std::env::current_dir().unwrap_or_default();
                 let local_path = operations::listing::resolve_relative(&input, &working_dir);
+                let entry_type = app.selected_entry().map(|e| e.entry_type.clone());
+                let remote_path = app.selected_entry().map(|e| e.path.clone());
 
-                if let Err(msg) = operations::download::validate_copy_destination(&local_path) {
-                    app.set_status(error_status(msg));
-                    app.cancel_path_prompt();
-                } else if local_path.exists() {
-                    app.mode = AppMode::OverwriteConfirm { path: local_path };
+                if entry_type == Some(EntryType::Directory) {
+                    // Directory download path
+                    if let Err(msg) = operations::download::validate_copy_destination(&local_path) {
+                        // Req 5.3: validation fails → error status
+                        app.set_status(error_status(msg));
+                        app.cancel_path_prompt();
+                    } else if local_path.exists() && local_path.is_dir() {
+                        // Req 5.4: destination exists as directory → overwrite confirm
+                        app.mode = AppMode::OverwriteConfirm { path: local_path };
+                    } else if local_path.exists() {
+                        // Destination exists but is not a directory → overwrite confirm
+                        app.mode = AppMode::OverwriteConfirm { path: local_path };
+                    } else {
+                        // Req 5.6: destination does not exist → proceed with download
+                        app.cancel_path_prompt();
+                        if let Some(rp) = remote_path {
+                            match operations::download::copy_remote_directory(ssh, &rp, &local_path) {
+                                Ok(result) => {
+                                    app.set_status(format_dir_copy_status(&result, &local_path));
+                                }
+                                Err(msg) => app.set_status(error_status(msg)),
+                            }
+                        }
+                    }
                 } else {
-                    // Do the copy
-                    let remote_path = app.selected_entry().map(|e| e.path.clone());
-                    app.cancel_path_prompt();
-                    if let Some(rp) = remote_path {
-                        match operations::download::copy_remote_file(ssh, &rp, &local_path) {
-                            Ok(bytes) => app.set_status(success_status(format!(
-                                "Copied {} to {}",
-                                types::format_size(bytes),
-                                local_path.display()
-                            ))),
-                            Err(msg) => app.set_status(error_status(msg)),
+                    // File/symlink copy path — preserve existing logic
+                    if let Err(msg) = operations::download::validate_copy_destination(&local_path) {
+                        app.set_status(error_status(msg));
+                        app.cancel_path_prompt();
+                    } else if local_path.exists() {
+                        app.mode = AppMode::OverwriteConfirm { path: local_path };
+                    } else {
+                        app.cancel_path_prompt();
+                        if let Some(rp) = remote_path {
+                            match operations::download::copy_remote_file(ssh, &rp, &local_path) {
+                                Ok(bytes) => app.set_status(success_status(format!(
+                                    "Copied {} to {}",
+                                    types::format_size(bytes),
+                                    local_path.display()
+                                ))),
+                                Err(msg) => app.set_status(error_status(msg)),
+                            }
                         }
                     }
                 }

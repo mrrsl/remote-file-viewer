@@ -287,6 +287,36 @@ impl SshClient {
         Ok(entries)
     }
 
+    /// Get total directory size in bytes via `du -sb <path>`.
+    ///
+    /// Uses `shell_escape` for path sanitization. Opens a channel session,
+    /// executes the command, and parses the first token of output as a u64.
+    pub fn dir_size(&self, path: &Path) -> Result<u64, SshError> {
+        let mut channel = self.session.channel_session().map_err(|e| {
+            if !self.session.authenticated() {
+                SshError::ConnectionLost
+            } else {
+                SshError::ConnectionFailed(format!("Failed to open channel: {}", e))
+            }
+        })?;
+
+        let path_str = path.to_string_lossy();
+        let command = format!("du -sb {}", shell_escape(&path_str));
+
+        channel.exec(&command).map_err(|e| {
+            SshError::ConnectionFailed(format!("Failed to execute du command: {}", e))
+        })?;
+
+        let mut output = String::new();
+        channel.read_to_string(&mut output).map_err(|e| {
+            SshError::IoError(e)
+        })?;
+
+        channel.wait_close().ok();
+
+        parse_du_output(&output)
+    }
+
     /// Check if the SSH connection is still alive.
     pub fn is_connected(&self) -> bool {
         self.session.authenticated()
@@ -312,7 +342,125 @@ impl SshClient {
     }
 }
 
+/// Parse the output of `du -sb` and return the byte count.
+///
+/// Expects the first whitespace-delimited token to be a valid u64.
+/// Returns `SshError::ConnectionFailed` if the output is empty or unparseable.
+pub fn parse_du_output(output: &str) -> Result<u64, SshError> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(SshError::ConnectionFailed(
+            "Could not determine directory size: empty output".to_string(),
+        ));
+    }
+
+    let token = trimmed.split_whitespace().next().unwrap_or("");
+    token.parse::<u64>().map_err(|_| {
+        SshError::ConnectionFailed(format!(
+            "Could not parse directory size from: {}",
+            token
+        ))
+    })
+}
+
 /// Simple shell escaping for a path used in a remote command.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_du_output_valid_tab_separated() {
+        let result = parse_du_output("1234\t/some/path");
+        assert_eq!(result.unwrap(), 1234);
+    }
+
+    #[test]
+    fn parse_du_output_valid_spaces() {
+        let result = parse_du_output("5678   /path/to/dir");
+        assert_eq!(result.unwrap(), 5678);
+    }
+
+    #[test]
+    fn parse_du_output_empty() {
+        let result = parse_du_output("");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SshError::ConnectionFailed(msg) => {
+                assert!(msg.contains("empty output"));
+            }
+            other => panic!("Expected ConnectionFailed, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_du_output_whitespace_only() {
+        let result = parse_du_output("   \t\n  ");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SshError::ConnectionFailed(msg) => {
+                assert!(msg.contains("empty output"));
+            }
+            other => panic!("Expected ConnectionFailed, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_du_output_invalid_number() {
+        let result = parse_du_output("abc\t/path");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SshError::ConnectionFailed(msg) => {
+                assert!(msg.contains("Could not parse directory size"));
+            }
+            other => panic!("Expected ConnectionFailed, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_du_output_only_number() {
+        let result = parse_du_output("1234");
+        assert_eq!(result.unwrap(), 1234);
+    }
+
+    #[test]
+    fn parse_du_output_large_value() {
+        let result = parse_du_output("18446744073709551615\t/big/dir");
+        assert_eq!(result.unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn parse_du_output_with_leading_newline() {
+        let result = parse_du_output("\n9999\t/path");
+        assert_eq!(result.unwrap(), 9999);
+    }
+
+    #[test]
+    fn parse_du_output_with_trailing_newline() {
+        let result = parse_du_output("4321\t/path\n");
+        assert_eq!(result.unwrap(), 4321);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Feature: arrow-nav-and-dir-download, Property 1: du output parsing round-trip
+    // Validates: Requirements 2.1, 2.2
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn du_parsing_round_trip(n: u64, p in "[a-zA-Z0-9_/. ]{1,100}") {
+            let formatted = format!("{}\t{}", n, p);
+            let result = parse_du_output(&formatted);
+            prop_assert_eq!(result.unwrap(), n);
+        }
+    }
 }

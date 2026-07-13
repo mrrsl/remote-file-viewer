@@ -21,7 +21,7 @@ use self::browser::render_browser;
 use self::footer::render_footer;
 use self::header::render_header;
 use self::navigate_prompt::render_navigate_prompt;
-use self::path_prompt::{render_copy_progress, render_overwrite_confirm, render_path_prompt};
+use self::path_prompt::{render_copy_progress, render_dir_copy_confirm, render_overwrite_confirm, render_path_prompt};
 use self::search_prompt::render_search_prompt;
 
 /// Render the full application UI based on the current app state.
@@ -230,6 +230,24 @@ pub fn render(frame: &mut Frame, app: &App, username: &str, host: &str) {
                 .map(|s| s.input.as_str())
                 .unwrap_or("");
             render_navigate_prompt(frame, prompt_chunks[1], input);
+
+            render_footer(
+                frame,
+                footer_area,
+                app.status_message.as_ref(),
+                app.loading,
+            );
+        }
+
+        AppMode::DirectoryCopyConfirm { path, size } => {
+            // Split main area: browser on top, directory confirm (3 lines) at bottom
+            let prompt_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(3)])
+                .split(main_area);
+
+            render_browser(frame, prompt_chunks[0], &app.entries, app.selected_index);
+            render_dir_copy_confirm(frame, prompt_chunks[1], path, *size);
 
             render_footer(
                 frame,
