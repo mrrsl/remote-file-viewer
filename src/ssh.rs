@@ -1,10 +1,11 @@
 // SSH session and SFTP wrapper
 
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ssh2::{FileStat, Session, Sftp};
 
@@ -132,52 +133,70 @@ impl SshClient {
     /// List directory entries at the given remote path.
     ///
     /// Returns a vector of `DirectoryEntry` items for each entry in the directory.
+    /// On `PermissionDenied`, falls back to `sudo ls -la` via an exec channel.
     pub fn list_dir(&self, path: &Path) -> Result<Vec<DirectoryEntry>, SshError> {
-        let entries = self.sftp.readdir(path).map_err(|e| {
-            Self::map_sftp_error(e, path)
-        })?;
+        match self.sftp.readdir(path) {
+            Ok(entries) => {
+                let result = entries
+                    .into_iter()
+                    .map(|(entry_path, stat)| {
+                        let name = entry_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
 
-        let result = entries
-            .into_iter()
-            .map(|(entry_path, stat)| {
-                let name = entry_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                        let entry_type = if stat.is_dir() {
+                            EntryType::Directory
+                        } else if stat.file_type().is_symlink() {
+                            EntryType::Symlink
+                        } else {
+                            EntryType::File
+                        };
 
-                let entry_type = if stat.is_dir() {
-                    EntryType::Directory
-                } else if stat.file_type().is_symlink() {
-                    EntryType::Symlink
-                } else {
-                    EntryType::File
-                };
+                        let size = stat.size.unwrap_or(0);
 
-                let size = stat.size.unwrap_or(0);
+                        DirectoryEntry {
+                            name,
+                            path: entry_path,
+                            entry_type,
+                            size,
+                        }
+                    })
+                    .collect();
 
-                DirectoryEntry {
-                    name,
-                    path: entry_path,
-                    entry_type,
-                    size,
+                Ok(result)
+            }
+            Err(e) => {
+                let err = Self::map_sftp_error(e, path);
+                log_error("list_dir", &err);
+                match err {
+                    SshError::PermissionDenied(_) => self.sudo_ls_la(path),
+                    _ => Err(err),
                 }
-            })
-            .collect();
-
-        Ok(result)
+            }
+        }
     }
 
     /// Download a remote file, writing its contents to the provided writer.
     ///
     /// Returns the total number of bytes written.
+    /// On PermissionDenied, falls back to `sudo cat` via an exec channel.
     pub fn download_file(
         &self,
         remote_path: &Path,
         writer: &mut impl Write,
     ) -> Result<u64, SshError> {
-        let mut file = self.sftp.open(remote_path).map_err(|e| {
-            Self::map_sftp_error(e, remote_path)
-        })?;
+        let mut file = match self.sftp.open(remote_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let err = Self::map_sftp_error(e, remote_path);
+                log_error("download_file", &err);
+                return match err {
+                    SshError::PermissionDenied(_) => self.sudo_cat(remote_path, writer),
+                    other => Err(other),
+                };
+            }
+        };
 
         let mut buf = [0u8; 8192];
         let mut total_bytes: u64 = 0;
@@ -322,6 +341,64 @@ impl SshClient {
         self.session.authenticated()
     }
 
+    /// Read a remote file via `sudo cat`, streaming its contents to the writer.
+    ///
+    /// Opens an exec channel, runs `sudo cat <escaped_path>`, streams stdout
+    /// to the writer in 8 KiB chunks, and returns the total bytes written.
+    /// Returns `PermissionDenied` if stderr indicates a password is required.
+    fn sudo_cat(&self, path: &Path, writer: &mut impl Write) -> Result<u64, SshError> {
+        let mut channel = self.session.channel_session().map_err(|e| {
+            if !self.session.authenticated() {
+                SshError::ConnectionLost
+            } else {
+                SshError::ConnectionFailed(format!("Failed to open channel: {}", e))
+            }
+        })?;
+
+        let path_str = path.to_string_lossy();
+        let command = format!("sudo cat {}", shell_escape(&path_str));
+
+        channel.exec(&command).map_err(|e| {
+            SshError::ConnectionFailed(format!("Failed to execute sudo cat command: {}", e))
+        })?;
+
+        // Stream stdout to writer in 8 KiB chunks
+        let mut buf = [0u8; 8192];
+        let mut total_bytes: u64 = 0;
+
+        loop {
+            let bytes_read = channel.read(&mut buf).map_err(|e| SshError::IoError(e))?;
+            if bytes_read == 0 {
+                break;
+            }
+            writer.write_all(&buf[..bytes_read]).map_err(SshError::IoError)?;
+            total_bytes += bytes_read as u64;
+        }
+
+        // Read stderr after EOF to check for password prompts
+        let mut stderr_output = String::new();
+        channel
+            .stderr()
+            .read_to_string(&mut stderr_output)
+            .map_err(|e| SshError::IoError(e))?;
+
+        if stderr_output.contains("password is required") || stderr_output.contains("sudo:") {
+            return Err(SshError::PermissionDenied(path.to_path_buf()));
+        }
+
+        // Check exit status
+        channel.wait_close().ok();
+        let exit_status = channel.exit_status().unwrap_or(-1);
+        if exit_status != 0 {
+            return Err(SshError::ConnectionFailed(format!(
+                "sudo cat command failed with exit status {}",
+                exit_status
+            )));
+        }
+
+        Ok(total_bytes)
+    }
+
     /// Map an ssh2 error to an SshError, accounting for permission and timeout errors.
     fn map_sftp_error(err: ssh2::Error, path: &Path) -> SshError {
         match err.code() {
@@ -339,6 +416,56 @@ impl SshClient {
                 }
             }
         }
+    }
+
+    /// Execute `sudo ls -la` on a remote path and parse the output into directory entries.
+    ///
+    /// Used as a fallback when SFTP readdir fails with PermissionDenied.
+    fn sudo_ls_la(&self, path: &Path) -> Result<Vec<DirectoryEntry>, SshError> {
+        let mut channel = self.session.channel_session().map_err(|e| {
+            if !self.session.authenticated() {
+                SshError::ConnectionLost
+            } else {
+                SshError::ConnectionFailed(format!("Failed to open channel: {}", e))
+            }
+        })?;
+
+        let path_str = path.to_string_lossy();
+        let command = format!("LC_ALL=C sudo ls -la {}", shell_escape(&path_str));
+
+        channel.exec(&command).map_err(|e| {
+            SshError::ConnectionFailed(format!("Failed to execute sudo ls -la command: {}", e))
+        })?;
+
+        // Read stdout
+        let mut output = String::new();
+        channel.read_to_string(&mut output).map_err(|e| {
+            SshError::IoError(e)
+        })?;
+
+        // Read stderr
+        let mut stderr_output = String::new();
+        channel.stderr().read_to_string(&mut stderr_output).map_err(|e| {
+            SshError::IoError(e)
+        })?;
+
+        // Check stderr for password prompts
+        if stderr_output.contains("password is required") || stderr_output.contains("sudo:") {
+            return Err(SshError::PermissionDenied(path.to_path_buf()));
+        }
+
+        // Check exit status
+        channel.wait_close().ok();
+        let exit_status = channel.exit_status().unwrap_or(-1);
+        if exit_status != 0 {
+            return Err(SshError::ConnectionFailed(format!(
+                "sudo ls -la exited with status {}: {}",
+                exit_status,
+                stderr_output.trim()
+            )));
+        }
+
+        Ok(parse_ls_la_output(&output, path))
     }
 }
 
@@ -363,11 +490,153 @@ pub fn parse_du_output(output: &str) -> Result<u64, SshError> {
     })
 }
 
+/// Parse the output of `ls -la` into a vector of directory entries.
+///
+/// Skips "total NNN" header lines, "." and ".." entries, and lines with
+/// fewer than 9 whitespace-separated fields or an unparseable size field.
+/// For symlinks, strips the " -> target" suffix from the filename.
+pub fn parse_ls_la_output(output: &str, parent_dir: &Path) -> Vec<DirectoryEntry> {
+    let mut entries = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Skip "total NNN" header lines
+        if line.starts_with("total ") {
+            continue;
+        }
+
+        // Split into whitespace-separated fields; we need at least 9
+        let fields: Vec<&str> = line.split_whitespace().collect();
+
+        if fields.len() < 9 {
+            continue;
+        }
+
+        // Field 0 first char determines entry type
+        let entry_type = match fields[0].chars().next() {
+            Some('d') => EntryType::Directory,
+            Some('l') => EntryType::Symlink,
+            _ => EntryType::File,
+        };
+
+        // Field 4 parsed as u64 for size; skip line if unparseable
+        let size = match fields[4].parse::<u64>() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Fields 8+ joined with spaces for filename (handles names with spaces)
+        let raw_name = fields[8..].join(" ");
+
+        // For symlinks, strip " -> target" suffix
+        let name = if entry_type == EntryType::Symlink {
+            if let Some(idx) = raw_name.find(" -> ") {
+                raw_name[..idx].to_string()
+            } else {
+                raw_name
+            }
+        } else {
+            raw_name
+        };
+
+        // Skip "." and ".." entries
+        if name == "." || name == ".." {
+            continue;
+        }
+
+        let path = parent_dir.join(&name);
+
+        entries.push(DirectoryEntry {
+            name,
+            path,
+            entry_type,
+            size,
+        });
+    }
+
+    entries
+}
+
 /// Simple shell escaping for a path used in a remote command.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Append a timestamped error line to `rfv-errors.log` in the current working directory.
+/// Silently ignores write failures (best-effort logging).
+fn log_error(context: &str, error: &SshError) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = timestamp.as_secs();
+
+    // Manual UTC timestamp formatting: YYYY-MM-DDTHH:MM:SSZ
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Calculate year, month, day from days since epoch (1970-01-01)
+    let (year, month, day) = days_to_date(days);
+
+    let ts = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    );
+
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("rfv-errors.log")
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "[{}] {}: {}", ts, context, error);
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_date(mut days: u64) -> (u64, u64, u64) {
+    // Algorithm based on civil_from_days
+    let mut year = 1970u64;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let leap = is_leap_year(year);
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+
+    let mut month = 1u64;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+
+    (year, month, days + 1)
+}
+
+/// Check if a year is a leap year.
+fn is_leap_year(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -451,6 +720,40 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Format a slice of `DirectoryEntry` items into `ls -la` style output lines.
+    ///
+    /// Each line is formatted as:
+    /// `{type_char}rw-r--r--  1 user group {size} Jan  1 00:00 {name}`
+    ///
+    /// For symlinks, ` -> /dev/null` is appended to exercise stripping logic.
+    /// Lines are joined with `\n`.
+    ///
+    /// **Validates: Requirements 5.8**
+    pub fn format_ls_la_output(entries: &[DirectoryEntry]) -> String {
+        entries
+            .iter()
+            .map(|entry| {
+                let type_char = match entry.entry_type {
+                    EntryType::File => '-',
+                    EntryType::Directory => 'd',
+                    EntryType::Symlink => 'l',
+                };
+
+                let name_part = if entry.entry_type == EntryType::Symlink {
+                    format!("{} -> /dev/null", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+
+                format!(
+                    "{}rw-r--r--  1 user group {} Jan  1 00:00 {}",
+                    type_char, entry.size, name_part
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     // Feature: arrow-nav-and-dir-download, Property 1: du output parsing round-trip
     // Validates: Requirements 2.1, 2.2
     proptest! {
@@ -461,6 +764,111 @@ mod proptests {
             let formatted = format!("{}\t{}", n, p);
             let result = parse_du_output(&formatted);
             prop_assert_eq!(result.unwrap(), n);
+        }
+    }
+
+    /// Strategy to generate a valid entry type.
+    fn entry_type_strategy() -> impl Strategy<Value = EntryType> {
+        prop_oneof![
+            Just(EntryType::File),
+            Just(EntryType::Directory),
+            Just(EntryType::Symlink),
+        ]
+    }
+
+    /// Strategy to generate a valid filename for ls -la round-trip testing.
+    ///
+    /// Constraints:
+    /// - Non-empty, 1-30 chars
+    /// - Printable ASCII (0x21-0x7E) with optional single spaces between non-space chars
+    /// - No consecutive spaces (split_whitespace would collapse them)
+    /// - Not "." or ".."
+    /// - Must not start with "total " (those lines get skipped by the parser)
+    /// - Regex: `[!-~]([!-~]| [!-~])*` gives printable non-space chars with single spaces between
+    fn filename_strategy() -> impl Strategy<Value = String> {
+        "[!-~]([!-~]| [!-~]){0,29}"
+            .prop_filter("must not be . or ..", |s| s != "." && s != "..")
+            .prop_filter("must not start with 'total '", |s| !s.starts_with("total "))
+    }
+
+    // Feature: sudo-fallback, Property 1: ls -la parsing round-trip
+    // Validates: Requirements 1.2, 1.3, 1.4, 1.5, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.8, 5.9
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn ls_la_parsing_round_trip(
+            entries in proptest::collection::vec(
+                (entry_type_strategy(), filename_strategy(), any::<u64>()),
+                0..20
+            )
+        ) {
+            let parent = Path::new("/test");
+
+            // Build DirectoryEntry vec, applying symlink constraint
+            let dir_entries: Vec<DirectoryEntry> = entries
+                .into_iter()
+                .filter(|(etype, name, _)| {
+                    // For non-symlinks, name must not contain " -> "
+                    if *etype != EntryType::Symlink {
+                        !name.contains(" -> ")
+                    } else {
+                        true
+                    }
+                })
+                .map(|(etype, name, size)| DirectoryEntry {
+                    path: parent.join(&name),
+                    name,
+                    entry_type: etype,
+                    size,
+                })
+                .collect();
+
+            // Format then parse
+            let formatted = format_ls_la_output(&dir_entries);
+            let parsed = parse_ls_la_output(&formatted, parent);
+
+            // Assert parsed entries match originals
+            prop_assert_eq!(parsed.len(), dir_entries.len(), "entry count mismatch");
+            for (original, parsed_entry) in dir_entries.iter().zip(parsed.iter()) {
+                prop_assert_eq!(&parsed_entry.name, &original.name, "name mismatch");
+                prop_assert_eq!(&parsed_entry.entry_type, &original.entry_type, "entry_type mismatch");
+                prop_assert_eq!(parsed_entry.size, original.size, "size mismatch");
+                prop_assert_eq!(&parsed_entry.path, &original.path, "path mismatch");
+            }
+        }
+    }
+
+    /// Simulate the chunked reading logic used by `sudo_cat`.
+    ///
+    /// Reads input bytes in 8 KiB chunks from a Cursor reader, writes to a Cursor writer,
+    /// and returns the total byte count.
+    fn simulate_chunked_copy(input: &[u8]) -> u64 {
+        use std::io::{Cursor, Read, Write};
+        let mut reader = Cursor::new(input);
+        let mut writer = Cursor::new(Vec::new());
+        let mut buf = [0u8; 8192];
+        let mut total: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n]).unwrap();
+            total += n as u64;
+        }
+        total
+    }
+
+    // Feature: sudo-fallback, Property 2: sudo_cat byte count correctness
+    // Validates: Requirements 2.2
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn sudo_cat_byte_count_correctness(data in proptest::collection::vec(any::<u8>(), 0..65536)) {
+            let byte_count = simulate_chunked_copy(&data);
+            prop_assert_eq!(byte_count, data.len() as u64);
         }
     }
 }

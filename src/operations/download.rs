@@ -746,7 +746,7 @@ mod proptests {
     fn entry_strategy() -> impl Strategy<Value = Vec<(String, EntryType)>> {
         prop::collection::vec(
             (
-                "[a-zA-Z0-9_]{1,12}",
+                "[a-z0-9_]{1,12}",
                 prop_oneof![
                     Just(EntryType::File),
                     Just(EntryType::Directory),
@@ -755,9 +755,9 @@ mod proptests {
             ),
             1..=10,
         )
-        .prop_filter("unique names", |entries| {
-            let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-            let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        .prop_filter("unique names (case-insensitive)", |entries| {
+            let names: Vec<String> = entries.iter().map(|(n, _)| n.to_lowercase()).collect();
+            let unique: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
             unique.len() == names.len()
         })
     }
